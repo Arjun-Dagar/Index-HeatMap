@@ -19,12 +19,13 @@ YouTube: @fabtraderinc
 X / Instagram / Telegram :  @Iamfabtrader
 """
 from logging import exception
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import requests
+import yfinance as yf
 
 
 @st.cache_data(ttl=300)
@@ -65,6 +66,66 @@ def get_index_details(category):
     except Exception as e:
         print("Error Fetching Index Data from NSE. Aborting....")
         return pd.DataFrame(), None
+
+@st.cache_data(ttl=300)
+def get_stocks_below_ema(df, top_n=5):
+    """
+    Get stocks that are below their 20-day EMA and return top N stocks with highest drop percentage
+    
+    Args:
+        df: DataFrame with stock symbols
+        top_n: Number of top stocks to return (default 5)
+    
+    Returns:
+        DataFrame with filtered stocks
+    """
+    if df.empty:
+        return df
+    
+    stocks_below_ema = []
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=50)  # Get 50 days of data for 20-day EMA
+    
+    for _, row in df.iterrows():
+        symbol = row['symbol']
+        try:
+            # Get historical data using yfinance
+            ticker = f"{symbol}.NS"
+            stock = yf.Ticker(ticker)
+            data = stock.history(start=start_date, end=end_date)
+            
+            if data.empty or len(data) < 20:
+                continue
+            
+            # Calculate 20-day EMA
+            ema_20 = data['Close'].ewm(span=20, adjust=False).mean()
+            current_price = data['Close'].iloc[-1]
+            ema_value = ema_20.iloc[-1]
+            
+            # Check if stock is below EMA
+            if current_price < ema_value:
+                drop_percentage = ((ema_value - current_price) / ema_value) * 100
+                stocks_below_ema.append({
+                    'symbol': symbol,
+                    'current_price': current_price,
+                    'ema_20': ema_value,
+                    'drop_percentage': drop_percentage,
+                    'pChange': row['pChange'],
+                    'ffmc': row['ffmc']
+                })
+                
+        except Exception as e:
+            # Skip stocks with errors
+            continue
+    
+    if not stocks_below_ema:
+        return pd.DataFrame()
+    
+    # Sort by drop percentage (highest drop first) and take top N
+    stocks_below_ema.sort(key=lambda x: x['drop_percentage'], reverse=True)
+    top_stocks = stocks_below_ema[:top_n]
+    
+    return pd.DataFrame(top_stocks)
 
 # Include any additional NSE indices to list below
 index_list = ['NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 50', 'NIFTY MIDCAP 100', 'NIFTY MIDCAP 150',
@@ -113,7 +174,7 @@ with header1:
     st.subheader("NSE Indices Heatmap - Visualizer")
     col1, col2, _ = st.columns([2,1,1])
     index_filter = col1.selectbox("Choose Index", index_list, index=0)
-    slice_by = col2.selectbox("Slice By", ["Market Cap","Gainers","Losers"], index=0)
+    slice_by = col2.selectbox("Slice By", ["Market Cap","Gainers","Losers","Top 5 below 20 EMA"], index=0)
 
 with header2:
     df, api_timestamp = get_index_details(index_filter)
@@ -168,16 +229,35 @@ if not df.empty:
         df['Abs'] = df['pChange'].abs()
         slice_factor = 'Abs'
         color_scale = ['#ff7a3a', 'white']
+    elif slice_by == 'Top 5 below 20 EMA':
+        # Get stocks below 20 EMA
+        st.info("🔍 **Top 5 below 20 EMA**: Shows stocks trading below their 20-day Exponential Moving Average, sorted by the highest percentage drop from EMA.")
+        with st.spinner('Calculating 20-day EMA for stocks... This may take a few moments.'):
+            ema_df = get_stocks_below_ema(df, top_n=5)
+        if not ema_df.empty:
+            df = ema_df
+            slice_factor = 'drop_percentage'
+            color_scale = ['#ff7a3a', 'white']
+        else:
+            st.warning("No stocks found below their 20-day EMA")
+            st.stop()
 
     # Plotly Treemap
     st.divider()
+    
+    # Prepare custom data based on filter type
+    if slice_by == 'Top 5 below 20 EMA':
+        custom_data = ['pChange', 'current_price', 'ema_20']
+    else:
+        custom_data = ['pChange']
+    
     fig = px.treemap(
         df,
         path=['symbol'],
         values=slice_factor,
         color='pChange',
         color_continuous_scale=color_scale,
-        custom_data=['pChange']
+        custom_data=custom_data
     )
     fig.update_layout(
         margin=dict(t=30, l=0, r=0, b=0),
@@ -185,11 +265,20 @@ if not df.empty:
         paper_bgcolor="rgba(0, 0, 0, 0)", plot_bgcolor="rgba(0, 0, 0, 0)",
         )
 
-    fig.update_traces(
-        hovertemplate='<b>%{label}</b><br>Size: %{value}<br>pChange: %{customdata[0]:.2f}%',
-        texttemplate='%{label}<br>%{customdata[0]:.2f}%',
-        textposition='middle center'
-    )
+    # Customize hover template and text template based on filter type
+    if slice_by == 'Top 5 below 20 EMA':
+        fig.update_traces(
+            hovertemplate='<b>%{label}</b><br>Drop from EMA: %{value:.2f}%<br>Current Price: ₹%{customdata[1]:.2f}<br>EMA: ₹%{customdata[2]:.2f}<br>pChange: %{customdata[0]:.2f}%',
+            texttemplate='<b>%{label}</b><br>Drop from EMA: %{value:.1f}%<br>Current Price: ₹%{customdata[1]:.0f}<br>EMA: ₹%{customdata[2]:.0f}<br>Today pChange: %{customdata[0]:.2f}%',
+            textfont=dict(size=16),
+            textposition='middle center'
+        )
+    else:
+        fig.update_traces(
+            hovertemplate='<b>%{label}</b><br>Size: %{value}<br>pChange: %{customdata[0]:.2f}%',
+            texttemplate='%{label}<br>%{customdata[0]:.2f}%',
+            textposition='middle center'
+        )
     fig.update_traces(textinfo="label+value")
     fig.update_coloraxes(showscale=False)
     st.plotly_chart(fig, use_container_width=True)
